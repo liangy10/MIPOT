@@ -1,0 +1,172 @@
+% Obtain data file details and read data
+[fileName, filePath] = uigetfile('*', 'Select the File Containing Cell Tracking Coordinates');
+
+if isequal(fileName, 0)
+    error('No file was selected.');
+end
+
+opts = detectImportOptions(fullfile(filePath, fileName));
+opts.DataLines = [5 Inf];
+opts.VariableNamesLine = 1;
+trackTable = readtable(fullfile(filePath, fileName), opts);
+
+if ismember('POSITION_T', trackTable.Properties.VariableNames)
+    timeSortVar = 'POSITION_T';
+else
+    timeSortVar = 'FRAME';
+end
+
+% Reorganize data into a struct
+trackIDs = unique(trackTable.TRACK_ID, 'stable');
+
+emptyTrackStruct = struct( ...
+    'TrackID', [], ...
+    'Frames', [], ...
+    'Time', [], ...
+    'XYZ', struct('X', [], 'Y', [], 'Z', []) ...
+);
+
+dataStruct = repmat(emptyTrackStruct, 1, numel(trackIDs));
+
+for i = 1:numel(trackIDs)
+    trackID = trackIDs(i);
+    currentID = trackTable.TRACK_ID == trackID;
+    subTable = sortrows(trackTable(currentID, :), timeSortVar);
+
+    dataStruct(i).TrackID = trackID;
+    dataStruct(i).Frames = subTable.FRAME;
+    dataStruct(i).Time = subTable.(timeSortVar);
+    dataStruct(i).XYZ.X = subTable.POSITION_X;
+    dataStruct(i).XYZ.Y = subTable.POSITION_Y;
+    dataStruct(i).XYZ.Z = subTable.POSITION_Z;
+end
+
+% Use the last track as reference for correction
+if numel(dataStruct) < 2
+    error('At least two tracks are required: one reference track and one corrected track.');
+end
+
+registrationRefTrack = dataStruct(end);
+refTime = registrationRefTrack.Time;
+refX = registrationRefTrack.XYZ.X;
+refY = registrationRefTrack.XYZ.Y;
+refZ = registrationRefTrack.XYZ.Z;
+
+% Correct all tracks above
+correctedDataStruct = repmat(emptyTrackStruct, 1, max(numel(dataStruct) - 1, 0));
+
+for i = 1:numel(dataStruct) - 1
+    currentTrack = dataStruct(i);
+    currentFrames = currentTrack.Frames;
+    currentTime = currentTrack.Time;
+    currentX = currentTrack.XYZ.X;
+    currentY = currentTrack.XYZ.Y;
+    currentZ = currentTrack.XYZ.Z;
+
+    correctedX = currentX;
+    correctedY = currentY;
+    correctedZ = currentZ;
+
+    for j = 2:numel(currentTime)
+        refPrevX = interp1(refTime, refX, currentTime(j-1), 'linear', 'extrap');
+        refCurrX = interp1(refTime, refX, currentTime(j), 'linear', 'extrap');
+        refPrevY = interp1(refTime, refY, currentTime(j-1), 'linear', 'extrap');
+        refCurrY = interp1(refTime, refY, currentTime(j), 'linear', 'extrap');
+        refPrevZ = interp1(refTime, refZ, currentTime(j-1), 'linear', 'extrap');
+        refCurrZ = interp1(refTime, refZ, currentTime(j), 'linear', 'extrap');
+
+        correctedX(j) = correctedX(j-1) + ...
+            (currentX(j) - currentX(j-1)) - (refCurrX - refPrevX);
+        correctedY(j) = correctedY(j-1) + ...
+            (currentY(j) - currentY(j-1)) - (refCurrY - refPrevY);
+        correctedZ(j) = correctedZ(j-1) + ...
+            (currentZ(j) - currentZ(j-1)) - (refCurrZ - refPrevZ);
+    end
+
+    correctedDataStruct(i).TrackID = currentTrack.TrackID;
+    correctedDataStruct(i).Frames = currentFrames;
+    correctedDataStruct(i).Time = currentTime;
+    correctedDataStruct(i).XYZ.X = correctedX;
+    correctedDataStruct(i).XYZ.Y = correctedY;
+    correctedDataStruct(i).XYZ.Z = correctedZ;
+end
+
+if isempty(correctedDataStruct)
+    error('No corrected tracks are available to export.');
+end
+
+% Calculate migration distance between consecutive time points
+allEndTimes = [];
+
+for i = 1:numel(correctedDataStruct)
+    if ~isstruct(correctedDataStruct(i)) || ~isfield(correctedDataStruct(i), 'XYZ')
+        error('correctedDataStruct(%d) is not a valid track struct.', i);
+    end
+
+    currentTime = correctedDataStruct(i).Time(:);
+    currentX = correctedDataStruct(i).XYZ.X(:);
+    currentY = correctedDataStruct(i).XYZ.Y(:);
+    currentZ = correctedDataStruct(i).XYZ.Z(:);
+
+    validMask = ~(isnan(currentTime) | isnan(currentX) | isnan(currentY) | isnan(currentZ));
+    currentTime = currentTime(validMask);
+    currentX = currentX(validMask);
+    currentY = currentY(validMask);
+    currentZ = currentZ(validMask);
+
+    correctedDataStruct(i).Time = currentTime;
+    correctedDataStruct(i).XYZ.X = currentX;
+    correctedDataStruct(i).XYZ.Y = currentY;
+    correctedDataStruct(i).XYZ.Z = currentZ;
+
+    if numel(currentTime) > 1
+        allEndTimes = [allEndTimes; currentTime(2:end)]; %#ok<AGROW>
+    end
+end
+
+if isempty(allEndTimes)
+    error('No valid consecutive time points were found for distance export.');
+end
+
+uniqueEndTimes = unique(allEndTimes, 'sorted');
+timeLabels = strcat("Time_", string(uniqueEndTimes));
+timeVarNames = matlab.lang.makeUniqueStrings(matlab.lang.makeValidName(timeLabels));
+
+distanceMatrix = NaN(numel(correctedDataStruct), numel(uniqueEndTimes));
+trackIDColumn = NaN(numel(correctedDataStruct), 1);
+fileNameColumn = strings(numel(correctedDataStruct), 1);
+
+for i = 1:numel(correctedDataStruct)
+    trackIDColumn(i) = correctedDataStruct(i).TrackID;
+    fileNameColumn(i) = correctedDataStruct(i).FileName;
+
+    currentTime = correctedDataStruct(i).Time(:);
+    currentX = correctedDataStruct(i).XYZ.X(:);
+    currentY = correctedDataStruct(i).XYZ.Y(:);
+    currentZ = correctedDataStruct(i).XYZ.Z(:);
+
+    if numel(currentTime) < 2
+        continue;
+    end
+
+    stepDistances = sqrt(diff(currentX).^2 + diff(currentY).^2 + diff(currentZ).^2);
+    endTimes = currentTime(2:end);
+
+    [isMatched, matchIdx] = ismember(endTimes, uniqueEndTimes);
+    distanceMatrix(i, matchIdx(isMatched)) = stepDistances(isMatched);
+end
+
+distanceTable = array2table(distanceMatrix, 'VariableNames', cellstr(timeVarNames));
+distanceTable = addvars(distanceTable, trackIDColumn, 'Before', 1, 'NewVariableNames', 'TrackID');
+distanceTable = addvars(distanceTable, fileNameColumn, 'Before', 1, 'NewVariableNames', 'FileName');
+
+timeMapTable = table(timeVarNames(:), uniqueEndTimes(:), ...
+    'VariableNames', {'ColumnName', 'TimeValue'});
+
+[~, baseName, ~] = fileparts(fileName);
+outputFile = fullfile(filePath, strcat(baseName, '_CorrectedStepDistances.xlsx'));
+
+writetable(distanceTable, outputFile, 'Sheet', 'Distances');
+writetable(timeMapTable, outputFile, 'Sheet', 'TimeMap');
+
+fprintf('Distance export saved to:\\n%s\\n', outputFile);
